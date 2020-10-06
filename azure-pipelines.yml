@@ -1,0 +1,232 @@
+# Docker
+# Build a Docker image 
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+#Déclancher l'evenement sur la branche masteur automatiquement après chaque
+# push ou pull request
+trigger:
+- master
+#Choisir la resource: pour notre cas, la resource se trouve sur notre serveur
+resources:
+- repo: self
+#Les variables à utiliser : ici le tag qui correspond à l'id courant du build
+variables:
+  tag: '$(Build.BuildId)'
+
+#Etape 1: Build et déployer les conteneur docker en production
+# Noter que j'ai crée un service docker hub 'devopsdanick' en renseignant mes informations
+# d'authentification. Ceci dans l'optique de ne pas mettre mes informations
+# à la volé. Je pouvais aussi décidé de créer des variables
+stages:
+  - stage: Build_docker_containers
+    jobs:
+    - job: Build
+      pool:
+        vmImage: 'ubuntu-latest'
+      continueOnError: true
+      steps:
+      #Build et déployement du frontend sur docker register 
+      # J'utilise dockerfile se trouvant dans le repertoire client.
+      # Noter que je pouvais utiliser aussi docker compose.
+      - task: Docker@2
+        inputs:
+          containerRegistry: 'devopsdanick'
+          repository: 'stratege/devops-frontend'
+          command: 'buildAndPush'
+          Dockerfile:  '$(Build.SourcesDirectory)/client/Dockerfile'
+        displayName: 'Build and publish frontend' 
+      # Build et déployement du serveur sur docker 
+      - task: Docker@2
+        inputs:
+          containerRegistry: 'devopsdanick'
+          repository: 'stratege/devops-backend'
+          command: 'buildAndPush'
+          Dockerfile:  '$(Build.SourcesDirectory)/api/Dockerfile' 
+        displayName: 'Build and publish backend' 
+  # Création d'un livrable intermediaire en me basant sur mon code source.
+  # J'e pouvais bien utiliser mes images docker ici. Mais cela sera plus loud et
+  # prendre plus de temps. Les images docker pourront me servir plutart si je 
+  # prevoir hoster plusieurs versions de l'application et laisser les utilisateurs
+  # choisir de migrer vers la version la plus recente ou pas.
+  - stage: 'Build_Artifact'
+    jobs:
+      - job: Artifact
+        pool:
+          vmImage: 'ubuntu-latest'
+        continueOnError: true
+        steps:
+        - task: NodeTool@0
+          inputs:
+            versionSpec: '10.16.3'
+          displayName: 'Install Node.js'
+
+        - script: |
+            npm install -g @angular/cli@10.0.1
+          displayName: 'Install angular cli'
+
+        - task: Npm@1
+          displayName: 'Install dependancies frontend'
+          inputs:
+            workingDir: '$(Build.SourcesDirectory)/client'
+            command: 'install'
+        - task: Npm@1
+          displayName: 'Install dependancies backend'
+          inputs:
+            workingDir: '$(Build.SourcesDirectory)/api'
+            command: 'install'
+
+        # Test du frontend
+        - script: |
+            ng test --watch false --codeCoverage true
+          displayName: 'Unit test frontend'
+          workingDirectory: '$(Build.SourcesDirectory)/client'
+
+        # Test du backend
+        - script: |
+            npm test --runInBand --detectOpenHandles --silent --forceExit --codeCoverage
+          displayName: 'Unit test backend'
+          workingDirectory: '$(Build.SourcesDirectory)/api'
+
+        - script: |
+            npm run lint
+          displayName: 'Code Analysis'
+          workingDirectory: '$(Build.SourcesDirectory)/client' 
+              
+        - script: |
+            npm run build --prod --output-path=dist
+          displayName: 'Build project' 
+          workingDirectory: '$(Build.SourcesDirectory)/client'
+        - task: PublishCodeCoverageResults@1
+          displayName: 'Publish Code Coverage Results'
+          condition: succeededOrFailed()
+          inputs:
+            pathToSources: '$(Build.SourcesDirectory)/client'
+            codeCoverageTool: Cobertura
+            summaryFileLocation: '$(Build.SourcesDirectory)/client/coverage/cobertura-coverage.xml'
+            reportDirectory: $(Build.SourcesDirectory)/client/coverage/coverage
+            failIfCoverageEmpty: true
+
+        - task: PublishPipelineArtifact@1
+          inputs:
+            targetPath: '$(Pipeline.Workspace)'
+            artifact: 'docker-compose'
+            publishLocation: 'pipeline'
+          displayName: 'Publish Artifacts' 
+
+  # Prédéployement:  l'idée est de créer un artifact qui doit être deploye
+  # facilement sur le serveur de production.
+  # Je vais ziper les fichiers front et le backend.
+  - stage: 'before_deploy_to_production'
+    jobs:
+    - deployment: Production
+      pool:
+        vmImage: 'ubuntu-latest'
+      environment: 'Developpment'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: ArchiveFiles@2
+              inputs:
+                rootFolderOrFile: '$(Pipeline.Workspace)/docker-compose/s/api'
+                includeRootFolder: true
+                archiveType: 'zip'
+                archiveFile: '$(Pipeline.Workspace)/docker-compose-zip/apizip/api.zip'
+                replaceExistingArchive: true
+            - task: ArchiveFiles@2
+              inputs:
+                rootFolderOrFile: '$(Pipeline.Workspace)/docker-compose/s/client/dist'
+                includeRootFolder: true
+                archiveType: 'zip'
+                archiveFile: '$(Pipeline.Workspace)/docker-compose-zip/clientzip/client.zip'
+                replaceExistingArchive: true
+            - task: PublishPipelineArtifact@1
+              inputs:
+                targetPath: '$(Pipeline.Workspace)/docker-compose-zip/'
+                artifact: 'docker-compose-zip'
+                publishLocation: 'pipeline'
+              displayName: 'Publish Artifacts' 
+
+  # Déployer les archives sur le serveur de production.
+  # J'ai crée une connexion ssh 'devopsssh' sur mon serveur distant lws.  
+  # Je ferai dans cette étape une copie des fichiers en ssh sur le serveur de 
+  # production. Je pouvais aussi utiliser le service fttp sur cette partie.            
+  - stage: 'Deploy_to_production'
+    jobs:
+    - deployment: Production
+      pool:
+        vmImage: 'ubuntu-latest'
+      environment: 'Production'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: CopyFilesOverSSH@0
+              inputs:
+                sshEndpoint: 'devopsssh'
+                sourceFolder: '$(Pipeline.Workspace)/docker-compose-zip/apizip'
+                contents: '**'
+                #contents: |
+                #  docker-compose.yml
+                #  .env
+                targetFolder: '/var/www/clients/client0/web37/upload'
+                #cleanTargetFolder: true
+                readyTimeout: '20000'
+                overwrite: true
+              displayName: 'Download server on server'
+
+            - task: CopyFilesOverSSH@0
+              inputs:
+                sshEndpoint: 'devopsssh'
+                sourceFolder: '$(Pipeline.Workspace)/docker-compose-zip/clientzip'
+                contents: '**'
+                #contents: |
+                #  docker-compose.yaml
+                #  .env
+                targetFolder: '/var/www/clients/client0/web36/upload'
+                cleanTargetFolder: true
+                #overwrite: true
+                readyTimeout: '20000'
+                 
+              displayName: 'Download client on server'
+
+#Normlization des fichiers sur le serveur de production.
+# Cette partie consiste à dézipper les fichiers et les copier dans les repertoires 
+# spécifiques puis redemarrer les services et supprimer les dossiers inutiles.
+  - stage: 'Nomalize_file_in_production'
+    jobs:
+    - deployment: Production
+      pool:
+        vmImage: 'ubuntu-latest'
+      environment: 'Production'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: SSH@0
+              inputs:
+                sshEndpoint: 'devopsssh'
+                runOptions: 'inline'
+                inline: |
+                  rm -rf /var/www/clients/client0/web36/web/*
+                  unzip /var/www/clients/client0/web36/upload/client.zip -d /var/www/clients/client0/web36/web/
+                  mv -f /var/www/clients/client0/web36/web/dist/* /var/www/clients/client0/web36/web/
+                  rm -rf /var/www/clients/client0/web36/web/dist/
+              displayName: 'Config client'
+            - task: SSH@0
+              inputs:
+                sshEndpoint: 'devopsssh'
+                runOptions: 'inline'
+                inline: |
+                  pm2 stop danick-devops
+                  rm -rf /var/www/clients/client0/web37/web/config /var/www/clients/client0/web37/web/app /var/www/clients/client0/web37/web/tests /var/www/clients/client0/web37/web/node_modules
+                  unzip /var/www/clients/client0/web37/upload/api.zip -d /var/www/clients/client0/web37/web/
+                  mv -u /var/www/clients/client0/web37/web/api/* /var/www/clients/client0/web37/web/
+                  rm -rf /var/www/clients/client0/web37/web/api/
+                  pm2 restart danick-devops
+              displayName: 'Config server'
+           
+                  
+                  
+
+      

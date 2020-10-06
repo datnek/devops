@@ -1,0 +1,24 @@
+version: '3'
+services:
+  backend:
+    #restart: always
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    ports:
+      - "3010:3010"
+    container_name: backend-devops
+    volumes:
+       - ./api:/var/api
+       - /var/api/node_modules
+  frontend:
+    #restart: always
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    ports:
+      - "4001:4001"
+    container_name: frontend-devops
+    volumes:
+       - ./client:/var/client
+       - /var/client/node_modules
